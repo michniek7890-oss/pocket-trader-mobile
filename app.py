@@ -359,12 +359,12 @@ form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}form but
 <div class="panel"><h2>Historia</h2><div id="history" class="history muted">Brak transakcji</div></div>
 <div class="panel">
  <h2>HISTORIA SYGNAŁÓW</h2>
- <div class="muted">Automatyczne zapisy sygnałów z analizy EUR/USD. NO SIGNAL oznacza pominiętą okazję.</div>
+ <div class="muted">Automatyczne zapisy sygnałów z analizy EUR/USD. NO SIGNAL otrzymuje status POMINIĘTO i nie wchodzi do statystyk wygranych/przegranych.</div>
  <div id="signalHistory" class="history muted" style="margin-top:10px">Brak zapisanych sygnałów. Odśwież analizę, aby rozpocząć zbieranie danych.</div>
 </div>
 <div class="panel">
  <h2>BACKTEST · WYNIKI SYGNAŁÓW</h2>
- <div class="muted">Wyniki kroczące liczone od wdrożenia tej wersji aplikacji, na podstawie późniejszej zmiany ceny.</div>
+ <div class="muted">Wyniki kroczące dla sygnałów CALL/PUT od wdrożenia tej wersji, na podstawie późniejszej zmiany ceny. NO SIGNAL jest pomijany.</div>
  <div class="controls" style="margin:12px 0">
   <label for="testExpiry" class="muted" style="align-self:center">Wygaśnięcie:</label>
   <select id="testExpiry"><option value="1">1 minuta</option><option value="2">2 minuty</option><option value="5">5 minut</option></select>
@@ -396,7 +396,11 @@ async function refreshSignalHistory(){
   const response=await fetch('/api/signal-history?limit=20');
   if(!response.ok) throw new Error('Błąd pobierania historii');
   const rows=await response.json();
-  setText('signalHistory',rows.length?rows.map(x=>new Date(x.candle_time*1000).toLocaleString('pl-PL')+' | '+x.direction+' | jakość '+x.score+'/100 | 1m: '+(x.outcome_1m||'oczekuje')+' | 2m: '+(x.outcome_2m||'oczekuje')+' | 5m: '+(x.outcome_5m||'oczekuje')).join('\n'):'Brak zapisanych sygnałów. Zostaw aplikację uruchomioną, aby zaczęła zbierać dane.');
+  setText('signalHistory',rows.length?rows.map(x=>{
+   const skipped=x.direction==='NO SIGNAL';
+   const label=v=>skipped?'POMINIĘTO':v==='win'?'WYGRANA':v==='loss'?'PRZEGRANA':v==='tie'?'REMIS':'OCZEKUJE';
+   return new Date(x.candle_time*1000).toLocaleString('pl-PL')+' | '+x.direction+' | jakość '+x.score+'/100 | 1m: '+label(x.outcome_1m)+' | 2m: '+label(x.outcome_2m)+' | 5m: '+label(x.outcome_5m);
+  }).join('\n'):'Brak zapisanych sygnałów. Zostaw aplikację uruchomioną, aby zaczęła zbierać dane.');
  }catch(e){setText('signalHistory','Nie udało się pobrać historii sygnałów.');}
 }
 async function showBacktest(){
@@ -524,11 +528,15 @@ def save_signal_and_update_results(candles, ai):
     with sqlite3.connect(DB) as con:
         con.execute("""
             INSERT OR IGNORE INTO signal_history
-            (candle_time, created_at, asset, direction, score, price, reasons)
-            VALUES (?, ?, 'EUR/USD', ?, ?, ?, ?)
+            (candle_time, created_at, asset, direction, score, price, reasons,
+             outcome_1m, outcome_2m, outcome_5m)
+            VALUES (?, ?, 'EUR/USD', ?, ?, ?, ?, ?, ?, ?)
         """, (signal_time, datetime.now(timezone.utc).isoformat(), direction,
               int(ai["score"]), float(signal_candle["close"]),
-              json.dumps(ai["reasons"], ensure_ascii=False)))
+              json.dumps(ai["reasons"], ensure_ascii=False),
+              "skipped" if direction == "NO SIGNAL" else None,
+              "skipped" if direction == "NO SIGNAL" else None,
+              "skipped" if direction == "NO SIGNAL" else None))
         # Wynik porównujemy z ceną zamknięcia świecy po upływie danego czasu.
         for row in con.execute("SELECT id, candle_time, direction, price FROM signal_history WHERE direction IN ('CALL','PUT') AND (outcome_1m IS NULL OR outcome_2m IS NULL OR outcome_5m IS NULL)").fetchall():
             rid, start, side, entry = row
