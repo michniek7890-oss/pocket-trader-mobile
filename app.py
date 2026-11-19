@@ -32,6 +32,21 @@ def init_db():
                 profit REAL NOT NULL
             )
         """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS signal_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                candle_time INTEGER NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                asset TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                score INTEGER NOT NULL,
+                price REAL NOT NULL,
+                reasons TEXT NOT NULL,
+                outcome_1m TEXT,
+                outcome_2m TEXT,
+                outcome_5m TEXT
+            )
+        """)
 
 
 init_db()
@@ -354,6 +369,22 @@ function makeChart(id){
   rightPriceScale:{borderColor:'#40536b'},timeScale:{borderColor:'#40536b',timeVisible:true,secondsVisible:false},
   crosshair:{mode:0}});
 }
+async function refreshSignalHistory(){
+ try{
+  const rows=await fetch('/api/signal-history?limit=20').then(r=>r.json());
+  setText('signalHistory',rows.length?rows.map(x=>new Date(x.candle_time*1000).toLocaleString('pl-PL')+' | '+x.direction+' | jakość '+x.score+'/100 | 1m: '+(x.outcome_1m||'oczekuje')+' | 2m: '+(x.outcome_2m||'oczekuje')+' | 5m: '+(x.outcome_5m||'oczekuje')).join('\n'):'Brak zapisanych sygnałów. Zostaw aplikację uruchomioną, aby zaczęła zbierać dane.');
+ }catch(e){setText('signalHistory','Nie udało się pobrać historii sygnałów.');}
+}
+async function showBacktest(){
+ try{
+  const expiry=document.getElementById('testExpiry').value;
+  const d=await fetch('/api/backtest?expiry='+expiry).then(r=>r.json());
+  setText('btSettled',d.settled+' (oczekuje: '+d.pending+')');
+  setText('btWL',d.wins+' / '+d.losses);
+  setText('btRate',d.win_rate==null?'—':d.win_rate+'%');
+  setText('btNote','Zapisane sygnały CALL/PUT: '+d.signals+' · remisy: '+d.ties+'. '+d.note);
+ }catch(e){setText('btNote','Nie udało się pobrać wyników testu.');}
+}
 function initCharts(){
  if(!window.LightweightCharts)return;
  priceChart=makeChart('priceChart');
@@ -392,7 +423,7 @@ async function loadSignal(){
    macdSignalLine.setData(d.macd_signal_series.filter(x=>x.value!==null));
    priceChart.timeScale().fitContent();rsiChart.timeScale().fitContent();macdChart.timeScale().fitContent();
   }
-  setText('lastUpdate','Ostatnia aktualizacja: '+new Date().toLocaleTimeString('pl-PL')+' · '+currentInterval);
+  setText('lastUpdate','Ostatnia aktualizacja: '+new Date().toLocaleTimeString('pl-PL')+' · '+currentInterval);\n   refreshSignalHistory();showBacktest();
  }catch(e){setText('lastUpdate','Błąd: '+e.message);document.getElementById('signal').textContent='BRAK DANYCH';}
 }
 async function refreshStats(){
@@ -405,7 +436,7 @@ async function refreshStats(){
 document.querySelectorAll('.interval').forEach(b=>b.addEventListener('click',()=>{
  document.querySelectorAll('.interval').forEach(x=>x.classList.remove('active'));b.classList.add('active');currentInterval=b.dataset.interval;loadSignal();
 }));
-document.getElementById('refresh').addEventListener('click',loadSignal);
+document.getElementById('refresh').addEventListener('click',loadSignal);\ndocument.getElementById('runBacktest').addEventListener('click',showBacktest);
 document.getElementById('tradeForm').addEventListener('submit',async e=>{
  e.preventDefault();
  const data={asset:document.getElementById('asset').value,direction:document.getElementById('direction').value,stake:Number(document.getElementById('stake').value),result:document.getElementById('result').value};
@@ -453,6 +484,68 @@ def get_stats():
     return {"count": row[0], "wins": row[1] or 0, "losses": row[2] or 0, "profit": row[3]}
 
 
+def save_signal_and_update_results(candles, ai):
+    """Zapisuje jeden sygnał na zamkniętą świecę M1 i uzupełnia wyniki po czasie."""
+    if len(candles) < 2:
+        return
+    # Ostatnia świeca może być jeszcze otwarta. Logujemy poprzednią, zamkniętą świecę.
+    signal_candle = candles[-2]
+    signal_time = int(signal_candle["time"])
+    direction = ai["signal"]
+    # Nie zapisujemy NO SIGNAL jako transakcji; zapisujemy je jako pominięte okazje.
+    with sqlite3.connect(DB) as con:
+        con.execute("""
+            INSERT OR IGNORE INTO signal_history
+            (candle_time, created_at, asset, direction, score, price, reasons)
+            VALUES (?, ?, 'EUR/USD', ?, ?, ?, ?)
+        """, (signal_time, datetime.now(timezone.utc).isoformat(), direction,
+              int(ai["score"]), float(signal_candle["close"]),
+              json.dumps(ai["reasons"], ensure_ascii=False)))
+        # Wynik porównujemy z ceną zamknięcia świecy po upływie danego czasu.
+        for row in con.execute("SELECT id, candle_time, direction, price FROM signal_history WHERE direction IN ('CALL','PUT') AND (outcome_1m IS NULL OR outcome_2m IS NULL OR outcome_5m IS NULL)").fetchall():
+            rid, start, side, entry = row
+            updates = {}
+            for minutes, column in ((1, "outcome_1m"), (2, "outcome_2m"), (5, "outcome_5m")):
+                target = start + minutes * 60
+                future = next((c for c in candles if int(c["time"]) >= target), None)
+                if future is not None:
+                    close = float(future["close"])
+                    result = "win" if (close > entry if side == "CALL" else close < entry) else "loss" if close != entry else "tie"
+                    updates[column] = result
+            for column, value in updates.items():
+                con.execute(f"UPDATE signal_history SET {column}=? WHERE id=?", (value, rid))
+
+
+@app.get("/api/signal-history")
+def get_signal_history(limit: int = Query(30, ge=1, le=200)):
+    with sqlite3.connect(DB) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute("SELECT * FROM signal_history ORDER BY candle_time DESC LIMIT ?", (limit,)).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["reasons"] = json.loads(item["reasons"])
+        result.append(item)
+    return result
+
+
+@app.get("/api/backtest")
+def get_backtest(expiry: int = Query(1, ge=1, le=5)):
+    if expiry not in (1, 2, 5):
+        raise HTTPException(status_code=400, detail="Dozwolone wygaśnięcia: 1, 2 lub 5 minut.")
+    column = f"outcome_{expiry}m"
+    with sqlite3.connect(DB) as con:
+        total, wins, losses, ties, pending = con.execute(
+            f"SELECT COUNT(*), SUM({column}='win'), SUM({column}='loss'), SUM({column}='tie'), SUM({column} IS NULL) FROM signal_history WHERE direction IN ('CALL','PUT')"
+        ).fetchone()
+    wins, losses, ties, pending = wins or 0, losses or 0, ties or 0, pending or 0
+    settled = wins + losses + ties
+    return {"expiry_minutes": int(expiry), "signals": total, "settled": settled,
+            "wins": wins, "losses": losses, "ties": ties, "pending": pending,
+            "win_rate": round(100 * wins / (wins + losses), 2) if wins + losses else None,
+            "note": "Test kroczący od momentu wdrożenia. Nie jest to test całej historii rynku."}
+
+
 @app.get("/api/forex/signal")
 def forex_signal(interval: str = Query("1min", pattern="^(1min|5min|15min|1h)$")):
     api_key = os.getenv("TWELVE_DATA_API_KEY")
@@ -463,6 +556,7 @@ def forex_signal(interval: str = Query("1min", pattern="^(1min|5min|15min|1h)$")
         candles_by_interval = {tf: fetch_candles(tf, api_key) for tf in intervals}
         snapshots = {tf: latest_snapshot(candles_by_interval[tf]) for tf in intervals}
         ai = evaluate_ai_signal(candles_by_interval, snapshots)
+        save_signal_and_update_results(candles_by_interval["1min"], ai)
 
         chart_candles = candles_by_interval[interval]
         chart_ind = snapshots[interval]["indicators"]
