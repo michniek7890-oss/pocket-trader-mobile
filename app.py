@@ -2,7 +2,10 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
+import time
+import threading
+import math
 import sqlite3
 import os
 import json
@@ -12,6 +15,9 @@ import urllib.error
 
 app = FastAPI(title="Pocket Trader Mobile DEMO")
 DB = Path("trades.db")
+_DATA_CACHE = {}
+_CACHE_LOCK = threading.Lock()
+_CACHE_TTL = 45
 
 
 def init_db():
@@ -68,6 +74,209 @@ def calculate_rsi_series(values, period=14):
     return result
 
 
+def calculate_sma_series(values, period):
+    result = [None] * len(values)
+    for i in range(period - 1, len(values)):
+        window = values[i - period + 1:i + 1]
+        result[i] = sum(window) / period
+    return result
+
+
+def calculate_std_series(values, period):
+    result = [None] * len(values)
+    for i in range(period - 1, len(values)):
+        window = values[i - period + 1:i + 1]
+        mean = sum(window) / period
+        result[i] = math.sqrt(sum((x - mean) ** 2 for x in window) / period)
+    return result
+
+
+def calculate_bollinger(closes, period=20, deviations=2):
+    middle = calculate_sma_series(closes, period)
+    std = calculate_std_series(closes, period)
+    upper, lower = [], []
+    for m, s in zip(middle, std):
+        upper.append(None if m is None or s is None else m + deviations * s)
+        lower.append(None if m is None or s is None else m - deviations * s)
+    return middle, upper, lower
+
+
+def calculate_atr_adx(candles, period=14):
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    closes = [c["close"] for c in candles]
+    trs, plus_dm, minus_dm = [], [], []
+    for i in range(len(candles)):
+        if i == 0:
+            trs.append(highs[i] - lows[i])
+            plus_dm.append(0.0)
+            minus_dm.append(0.0)
+            continue
+        up = highs[i] - highs[i - 1]
+        down = lows[i - 1] - lows[i]
+        plus_dm.append(up if up > down and up > 0 else 0.0)
+        minus_dm.append(down if down > up and down > 0 else 0.0)
+        trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
+
+    atr = [None] * len(candles)
+    plus_di = [None] * len(candles)
+    minus_di = [None] * len(candles)
+    dx = [None] * len(candles)
+    adx = [None] * len(candles)
+    if len(candles) <= period:
+        return atr, adx
+    for i in range(period, len(candles)):
+        start = i - period + 1
+        tr_sum = sum(trs[start:i + 1])
+        p_sum = sum(plus_dm[start:i + 1])
+        m_sum = sum(minus_dm[start:i + 1])
+        atr[i] = tr_sum / period
+        if tr_sum > 0:
+            plus_di[i] = 100 * p_sum / tr_sum
+            minus_di[i] = 100 * m_sum / tr_sum
+            denom = plus_di[i] + minus_di[i]
+            dx[i] = 0 if denom == 0 else 100 * abs(plus_di[i] - minus_di[i]) / denom
+    for i in range(period * 2 - 1, len(candles)):
+        vals = [x for x in dx[i - period + 1:i + 1] if x is not None]
+        if vals:
+            adx[i] = sum(vals) / len(vals)
+    return atr, adx
+
+
+def build_indicators(candles):
+    closes = [c["close"] for c in candles]
+    ema9 = calculate_ema_series(closes, 9)
+    ema21 = calculate_ema_series(closes, 21)
+    ema50 = calculate_ema_series(closes, 50)
+    ema200 = calculate_ema_series(closes, 200)
+    rsi = calculate_rsi_series(closes, 14)
+    ema12 = calculate_ema_series(closes, 12)
+    ema26 = calculate_ema_series(closes, 26)
+    macd = [None if a is None or b is None else a - b for a, b in zip(ema12, ema26)]
+    valid_macd = [x for x in macd if x is not None]
+    signal_valid = calculate_ema_series(valid_macd, 9)
+    macd_signal = [None] * len(closes)
+    first = next((i for i, x in enumerate(macd) if x is not None), len(closes))
+    for j, value in enumerate(signal_valid):
+        if first + j < len(macd_signal):
+            macd_signal[first + j] = value
+    middle, upper, lower = calculate_bollinger(closes)
+    atr, adx = calculate_atr_adx(candles)
+    return {
+        "ema9": ema9, "ema21": ema21, "ema50": ema50, "ema200": ema200,
+        "rsi": rsi, "macd": macd, "macd_signal": macd_signal,
+        "bb_middle": middle, "bb_upper": upper, "bb_lower": lower,
+        "atr": atr, "adx": adx
+    }
+
+
+def fetch_candles(interval, api_key, outputsize=220):
+    now = time.time()
+    with _CACHE_LOCK:
+        cached = _DATA_CACHE.get(interval)
+        if cached and now - cached["time"] < _CACHE_TTL:
+            return cached["candles"]
+    params = urllib.parse.urlencode({
+        "symbol": "EUR/USD", "interval": interval,
+        "outputsize": str(outputsize), "apikey": api_key
+    })
+    url = "https://api.twelvedata.com/time_series?" + params
+    request = urllib.request.Request(url, headers={"User-Agent": "PocketTraderDemo/2.0"})
+    with urllib.request.urlopen(request, timeout=18) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    if "values" not in data:
+        raise ValueError(data.get("message", "Dostawca nie zwrócił notowań."))
+    candles = []
+    for item in reversed(data["values"]):
+        dt = datetime.fromisoformat(item["datetime"])
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        candles.append({
+            "time": int(dt.timestamp()),
+            "open": float(item["open"]), "high": float(item["high"]),
+            "low": float(item["low"]), "close": float(item["close"])
+        })
+    if len(candles) < 205:
+        raise ValueError(f"Za mało świec dla {interval}: potrzeba co najmniej 205, otrzymano {len(candles)}.")
+    with _CACHE_LOCK:
+        _DATA_CACHE[interval] = {"time": now, "candles": candles}
+    return candles
+
+
+def latest_snapshot(candles):
+    ind = build_indicators(candles)
+    last = len(candles) - 1
+    def val(key):
+        return ind[key][last]
+    return {
+        "close": candles[last]["close"],
+        "ema9": val("ema9"), "ema21": val("ema21"),
+        "ema50": val("ema50"), "ema200": val("ema200"),
+        "rsi": val("rsi"), "macd": val("macd"),
+        "macd_signal": val("macd_signal"),
+        "adx": val("adx"), "atr": val("atr"),
+        "bb_upper": val("bb_upper"), "bb_lower": val("bb_lower"),
+        "indicators": ind
+    }
+
+
+def evaluate_ai_signal(candles_by_interval, snapshots):
+    m1 = snapshots["1min"]
+    candle = candles_by_interval["1min"][-1]
+    previous = candles_by_interval["1min"][-2]
+    trend_up = all(s["ema50"] is not None and s["ema200"] is not None and s["ema50"] > s["ema200"] for s in snapshots.values())
+    trend_down = all(s["ema50"] is not None and s["ema200"] is not None and s["ema50"] < s["ema200"] for s in snapshots.values())
+    bullish = (candle["close"] > candle["open"] and previous["close"] < previous["open"]
+               and candle["close"] >= previous["open"] and candle["open"] <= previous["close"]) or candle["close"] > previous["high"]
+    bearish = (candle["close"] < candle["open"] and previous["close"] > previous["open"]
+               and candle["close"] <= previous["open"] and candle["open"] >= previous["close"]) or candle["close"] < previous["low"]
+    rsi = m1["rsi"]
+    hist = None if m1["macd"] is None or m1["macd_signal"] is None else m1["macd"] - m1["macd_signal"]
+    atr_pct = None if not m1["atr"] or not m1["close"] else 100 * m1["atr"] / m1["close"]
+    volatility_ok = atr_pct is not None and 0.005 <= atr_pct <= 0.20
+    call_score = (60 if trend_up else 0)
+    put_score = (60 if trend_down else 0)
+    if rsi is not None:
+        if 50 < rsi < 68: call_score += 10
+        if 32 < rsi < 50: put_score += 10
+    if hist is not None:
+        if hist > 0: call_score += 10
+        if hist < 0: put_score += 10
+    if m1["adx"] is not None and m1["adx"] >= 20:
+        call_score += 10
+        put_score += 10
+    if bullish: call_score += 5
+    if bearish: put_score += 5
+    if volatility_ok:
+        call_score += 5
+        put_score += 5
+    call_band_ok = m1["bb_upper"] is not None and m1["close"] < m1["bb_upper"]
+    put_band_ok = m1["bb_lower"] is not None and m1["close"] > m1["bb_lower"]
+    call_ok = trend_up and rsi is not None and 50 < rsi < 68 and hist is not None and hist > 0 and m1["adx"] is not None and m1["adx"] >= 20 and bullish and volatility_ok and call_band_ok and call_score >= 85
+    put_ok = trend_down and rsi is not None and 32 < rsi < 50 and hist is not None and hist < 0 and m1["adx"] is not None and m1["adx"] >= 20 and bearish and volatility_ok and put_band_ok and put_score >= 85
+    signal = "CALL" if call_ok else "PUT" if put_ok else "NO SIGNAL"
+    score = call_score if signal == "CALL" else put_score if signal == "PUT" else max(call_score, put_score)
+    reasons = []
+    reasons.append("Trend M1/M5/M15/H1 zgodny" if trend_up or trend_down else "Brak pełnej zgodności trendu na M1/M5/M15/H1")
+    reasons.append("MACD potwierdza momentum" if (signal == "CALL" and hist and hist > 0) or (signal == "PUT" and hist and hist < 0) else "MACD nie potwierdza jednoznacznie kierunku")
+    reasons.append("ADX potwierdza siłę trendu" if m1["adx"] is not None and m1["adx"] >= 20 else "Trend za słaby (ADX poniżej 20)")
+    reasons.append("Świeca potwierdza kierunek" if (signal == "CALL" and bullish) or (signal == "PUT" and bearish) else "Brak potwierdzenia świecowego")
+    if not volatility_ok:
+        reasons.append("Zmienność poza zakresem filtra")
+    return {
+        "signal": signal, "score": int(score), "reasons": reasons,
+        "trend": {"M1": "UP" if snapshots["1min"]["ema50"] > snapshots["1min"]["ema200"] else "DOWN",
+                  "M5": "UP" if snapshots["5min"]["ema50"] > snapshots["5min"]["ema200"] else "DOWN",
+                  "M15": "UP" if snapshots["15min"]["ema50"] > snapshots["15min"]["ema200"] else "DOWN",
+                  "H1": "UP" if snapshots["1h"]["ema50"] > snapshots["1h"]["ema200"] else "DOWN"},
+        "expiry": "2–3 min (wyłącznie do testów DEMO)" if signal != "NO SIGNAL" else "Brak – NO SIGNAL",
+        "rsi": round(rsi, 2) if rsi is not None else None,
+        "adx": round(m1["adx"], 2) if m1["adx"] is not None else None,
+        "atr": round(m1["atr"], 6) if m1["atr"] is not None else None,
+        "atr_pct": round(atr_pct, 4) if atr_pct is not None else None
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 def home():
     return r"""<!DOCTYPE html>
@@ -91,7 +300,7 @@ button{cursor:pointer}button.active,.primary{background:var(--green);color:#1025
 select{min-width:110px}.chart{height:290px;width:100%}.smallchart{height:150px;width:100%}
 .metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.metric{background:#142135;border-radius:9px;padding:10px;min-width:0}
 .metric span{display:block;color:var(--muted);font-size:12px;margin-bottom:5px}.metric strong{font-size:16px;overflow-wrap:anywhere}
-.signal{font-size:22px;font-weight:bold}.buy{color:var(--green)}.sell{color:var(--red)}.neutral{color:#ffd479}
+.signal{font-size:22px;font-weight:bold}.buy{color:var(--green)}.sell{color:var(--red)}.neutral{color:#ffd479}.ai-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.ai-box{background:#142135;border-radius:9px;padding:10px}.ai-box strong{display:block;margin-top:5px}.reason-list{padding-left:18px;color:var(--muted);line-height:1.55}.trend-row{display:flex;gap:7px;flex-wrap:wrap}.trend-chip{background:#142135;padding:7px 9px;border-radius:8px;font-size:12px}
 form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}form button{grid-column:1/-1}
 .history{white-space:pre-wrap;line-height:1.6;overflow-wrap:anywhere}
 @media(max-width:520px){main{padding:11px}.chart{height:250px}.metrics{grid-template-columns:repeat(2,1fr)}form{grid-template-columns:1fr}.top{align-items:flex-start}}
@@ -112,10 +321,23 @@ form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}form but
   <div class="metric"><span>EMA 21</span><strong id="ema21">—</strong></div>
  </div>
  <div id="priceChart" class="chart"></div>
- <div class="muted">Świece: dane dostawcy Twelve Data · Linie: EMA 9 i EMA 21</div>
+ <div class="muted">Świece: dane dostawcy Twelve Data · Linie: EMA 9, 21, 50 i 200</div>
 </div>
 <div class="panel"><h2>RSI 14</h2><div class="metrics"><div class="metric"><span>Wartość</span><strong id="rsi">—</strong></div><div class="metric"><span>Interpretacja</span><strong id="rsiText">—</strong></div></div><div id="rsiChart" class="smallchart"></div></div>
 <div class="panel"><h2>MACD (12, 26, 9)</h2><div class="metrics"><div class="metric"><span>MACD</span><strong id="macd">—</strong></div><div class="metric"><span>Linia sygnałowa</span><strong id="macdSignal">—</strong></div><div class="metric"><span>Histogram</span><strong id="macdHist">—</strong></div></div><div id="macdChart" class="smallchart"></div></div>
+<div class="panel">
+ <h2>POCKET TRADER AI · SELECTIVE / MAXIMUM</h2>
+ <div class="ai-grid">
+  <div class="ai-box"><span class="muted">Zgodność filtrów</span><strong id="signalScore">— / 100</strong></div>
+  <div class="ai-box"><span class="muted">Sugerowane wygaśnięcie</span><strong id="expiry">—</strong></div>
+  <div class="ai-box"><span class="muted">ADX M1</span><strong id="adx">—</strong></div>
+  <div class="ai-box"><span class="muted">ATR M1</span><strong id="atr">—</strong></div>
+ </div>
+ <p class="muted">Potwierdzenie trendu: EMA 50/200</p>
+ <div class="trend-row" id="trendSummary">M1: — · M5: — · M15: — · H1: —</div>
+ <h2 style="margin-top:15px">Uzasadnienie decyzji</h2>
+ <ul class="reason-list" id="signalReasons"><li>Oczekiwanie na analizę…</li></ul>
+</div>
 <div class="panel"><h2>Dodaj transakcję testową</h2>
 <form id="tradeForm"><input id="asset" value="EUR/USD" aria-label="Instrument"><select id="direction"><option value="CALL">CALL</option><option value="PUT">PUT</option></select><input id="stake" type="number" min="0.01" step="0.01" value="10" aria-label="Kwota DEMO"><select id="result"><option value="win">Wygrana testowa</option><option value="loss">Przegrana testowa</option></select><button class="primary" type="submit">Zapisz symulację</button></form></div>
 <div class="panel"><h2>Statystyki DEMO</h2><div class="metrics"><div class="metric"><span>Transakcje</span><strong id="count">0</strong></div><div class="metric"><span>Wygrane / przegrane</span><strong id="wl">0 / 0</strong></div><div class="metric"><span>Wynik DEMO</span><strong id="profit">0.00</strong></div></div></div>
@@ -123,7 +345,7 @@ form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}form but
 <p class="note">DEMO: analiza ma charakter edukacyjny. Sygnały CALL/PUT nie gwarantują wyniku i nie otwierają transakcji. Nie jest to połączenie z Pocket Option ani rekomendacja inwestycyjna.</p>
 </main>
 <script>
-let currentInterval='1min', priceChart, rsiChart, macdChart, candleSeries, ema9Series, ema21Series, rsiSeries, macdLine, macdSignalLine;
+let currentInterval='1min', priceChart, rsiChart, macdChart, candleSeries, ema9Series, ema21Series, ema50Series, ema200Series, rsiSeries, macdLine, macdSignalLine;
 function makeChart(id){
  const el=document.getElementById(id);
  return LightweightCharts.createChart(el,{width:el.clientWidth,height:el.clientHeight,
@@ -138,6 +360,8 @@ function initCharts(){
  candleSeries=priceChart.addCandlestickSeries({upColor:'#55d6a2',downColor:'#ff6b78',borderVisible:false,wickUpColor:'#55d6a2',wickDownColor:'#ff6b78'});
  ema9Series=priceChart.addLineSeries({color:'#f5c451',lineWidth:2,priceLineVisible:false});
  ema21Series=priceChart.addLineSeries({color:'#64a9ff',lineWidth:2,priceLineVisible:false});
+  ema50Series=priceChart.addLineSeries({color:'#d18cff',lineWidth:1,priceLineVisible:false});
+  ema200Series=priceChart.addLineSeries({color:'#ff8f70',lineWidth:1,priceLineVisible:false});
  rsiChart=makeChart('rsiChart');rsiSeries=rsiChart.addLineSeries({color:'#c49bff',lineWidth:2,priceLineVisible:false});
  macdChart=makeChart('macdChart');macdLine=macdChart.addLineSeries({color:'#55d6a2',lineWidth:2,priceLineVisible:false});
  macdSignalLine=macdChart.addLineSeries({color:'#ffb86b',lineWidth:2,priceLineVisible:false});
@@ -153,10 +377,16 @@ async function loadSignal(){
   setText('rsi',Number(d.rsi14).toFixed(2));setText('rsiText',d.rsi14>=70?'Wykupienie':d.rsi14<=30?'Wyprzedanie':'Strefa neutralna');
   setText('macd',Number(d.macd).toFixed(6));setText('macdSignal',Number(d.macd_signal).toFixed(6));setText('macdHist',Number(d.macd_hist).toFixed(6));
   const sig=document.getElementById('signal');sig.textContent=d.signal;sig.className='signal '+(d.signal==='CALL'?'buy':d.signal==='PUT'?'sell':'neutral');
+  const ai=d.ai||{};setText('signalScore',(ai.score??'—')+' / 100');setText('expiry',ai.expiry||'—');
+  setText('adx',ai.adx==null?'—':ai.adx);setText('atr',ai.atr==null?'—':ai.atr);
+  const tr=ai.trend||{};setText('trendSummary',['M1','M5','M15','H1'].map(k=>k+': '+(tr[k]||'—')).join(' · '));
+  document.getElementById('signalReasons').innerHTML=(ai.reasons||['Brak szczegółów']).map(x=>'<li>'+x+'</li>').join('');
   if(priceChart){
    candleSeries.setData(d.candles);
    ema9Series.setData(d.ema9_series.filter(x=>x.value!==null));
    ema21Series.setData(d.ema21_series.filter(x=>x.value!==null));
+    ema50Series.setData(d.ema50_series.filter(x=>x.value!==null));
+    ema200Series.setData(d.ema200_series.filter(x=>x.value!==null));
    rsiSeries.setData(d.rsi_series.filter(x=>x.value!==null));
    macdLine.setData(d.macd_series.filter(x=>x.value!==null));
    macdSignalLine.setData(d.macd_signal_series.filter(x=>x.value!==null));
@@ -228,74 +458,48 @@ def forex_signal(interval: str = Query("1min", pattern="^(1min|5min|15min|1h)$")
     api_key = os.getenv("TWELVE_DATA_API_KEY")
     if not api_key:
         return {"error": "Brak klucza API w ustawieniach Render."}
-    params = urllib.parse.urlencode({
-        "symbol": "EUR/USD", "interval": interval, "outputsize": "100",
-        "apikey": api_key
-    })
-    url = "https://api.twelvedata.com/time_series?" + params
+    intervals = ["1min", "5min", "15min", "1h"]
     try:
-        request = urllib.request.Request(url, headers={"User-Agent": "PocketTraderDemo/1.0"})
-        with urllib.request.urlopen(request, timeout=15) as response:
-            data = json.loads(response.read().decode("utf-8"))
-        if "values" not in data:
-            return {"error": data.get("message", "Dostawca danych nie zwrócił notowań.")}
-        candles_raw = list(reversed(data["values"]))
-        candles = []
-        closes = []
-        for item in candles_raw:
-            dt = datetime.fromisoformat(item["datetime"])
-            candles.append({
-                "time": int(dt.timestamp()),
-                "open": float(item["open"]), "high": float(item["high"]),
-                "low": float(item["low"]), "close": float(item["close"])
-            })
-            closes.append(float(item["close"]))
-        if len(closes) < 35:
-            return {"error": "Za mało danych do obliczenia wskaźników."}
+        candles_by_interval = {tf: fetch_candles(tf, api_key) for tf in intervals}
+        snapshots = {tf: latest_snapshot(candles_by_interval[tf]) for tf in intervals}
+        ai = evaluate_ai_signal(candles_by_interval, snapshots)
 
-        e9 = calculate_ema_series(closes, 9)
-        e21 = calculate_ema_series(closes, 21)
-        rsi = calculate_rsi_series(closes, 14)
-        ema12 = calculate_ema_series(closes, 12)
-        ema26 = calculate_ema_series(closes, 26)
-        macd_values = [None if a is None or b is None else a-b for a,b in zip(ema12,ema26)]
-        valid_macd = [x for x in macd_values if x is not None]
-        signal_valid = calculate_ema_series(valid_macd, 9)
-        macd_signal = [None] * len(closes)
-        start = next((i for i,x in enumerate(macd_values) if x is not None), len(closes))
-        for j,value in enumerate(signal_valid):
-            macd_signal[start+j] = value
+        chart_candles = candles_by_interval[interval]
+        chart_ind = snapshots[interval]["indicators"]
+        chart_last = len(chart_candles) - 1
 
-        last_macd = macd_values[-1]
-        last_signal = macd_signal[-1]
-        last_rsi = rsi[-1]
-        signal = "NO SIGNAL"
-        if e9[-1] is not None and e21[-1] is not None and last_rsi is not None and last_macd is not None and last_signal is not None:
-            if e9[-1] > e21[-1] and 50 < last_rsi < 70 and last_macd > last_signal:
-                signal = "CALL"
-            elif e9[-1] < e21[-1] and 30 < last_rsi < 50 and last_macd < last_signal:
-                signal = "PUT"
-
-        def points(values):
+        def points(values, candles):
             return [{"time": candles[i]["time"], "value": round(v, 6)}
-                    for i,v in enumerate(values) if v is not None]
+                    for i, v in enumerate(values) if v is not None]
+
+        def last_value(key):
+            return chart_ind[key][chart_last]
 
         return {
             "mode": "DEMO", "symbol": "EUR/USD", "interval": interval,
-            "price": round(closes[-1], 5), "ema9": round(e9[-1], 5),
-            "ema21": round(e21[-1], 5), "rsi14": round(last_rsi, 2),
-            "macd": round(last_macd, 6), "macd_signal": round(last_signal, 6),
-            "macd_hist": round(last_macd-last_signal, 6), "signal": signal,
-            "candles": candles, "ema9_series": points(e9),
-            "ema21_series": points(e21), "rsi_series": points(rsi),
-            "macd_series": points(macd_values),
-            "macd_signal_series": points(macd_signal),
-            "note": "Sygnał testowy. Nie otwiera transakcji i nie gwarantuje zysku."
+            "price": round(chart_candles[-1]["close"], 5),
+            "ema9": round(last_value("ema9"), 5),
+            "ema21": round(last_value("ema21"), 5),
+            "rsi14": round(last_value("rsi"), 2),
+            "macd": round(last_value("macd"), 6),
+            "macd_signal": round(last_value("macd_signal"), 6),
+            "macd_hist": round(last_value("macd") - last_value("macd_signal"), 6),
+            "signal": ai["signal"], "ai": ai,
+            "candles": chart_candles,
+            "ema9_series": points(chart_ind["ema9"], chart_candles),
+            "ema21_series": points(chart_ind["ema21"], chart_candles),
+            "ema50_series": points(chart_ind["ema50"], chart_candles),
+            "ema200_series": points(chart_ind["ema200"], chart_candles),
+            "rsi_series": points(chart_ind["rsi"], chart_candles),
+            "macd_series": points(chart_ind["macd"], chart_candles),
+            "macd_signal_series": points(chart_ind["macd_signal"], chart_candles),
+            "note": "Analiza edukacyjna DEMO. Ocena jakości nie jest prawdopodobieństwem wygranej. Sygnały nie otwierają transakcji."
         }
     except urllib.error.URLError:
         return {"error": "Nie udało się połączyć z dostawcą danych."}
-    except (KeyError, ValueError, TypeError):
+    except ValueError as exc:
+        return {"error": str(exc)}
+    except (KeyError, TypeError, IndexError):
         return {"error": "Dane dostawcy mają nieoczekiwany format."}
     except Exception:
         return {"error": "Wystąpił błąd analizy danych. Spróbuj ponownie."}
-    
