@@ -357,6 +357,28 @@ form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}form but
 <form id="tradeForm"><input id="asset" value="EUR/USD" aria-label="Instrument"><select id="direction"><option value="CALL">CALL</option><option value="PUT">PUT</option></select><input id="stake" type="number" min="0.01" step="0.01" value="10" aria-label="Kwota DEMO"><select id="result"><option value="win">Wygrana testowa</option><option value="loss">Przegrana testowa</option></select><button class="primary" type="submit">Zapisz symulację</button></form></div>
 <div class="panel"><h2>Statystyki DEMO</h2><div class="metrics"><div class="metric"><span>Transakcje</span><strong id="count">0</strong></div><div class="metric"><span>Wygrane / przegrane</span><strong id="wl">0 / 0</strong></div><div class="metric"><span>Wynik DEMO</span><strong id="profit">0.00</strong></div></div></div>
 <div class="panel"><h2>Historia</h2><div id="history" class="history muted">Brak transakcji</div></div>
+<div class="panel">
+ <h2>HISTORIA SYGNAŁÓW</h2>
+ <div class="muted">Automatyczne zapisy sygnałów z analizy EUR/USD. NO SIGNAL oznacza pominiętą okazję.</div>
+ <div id="signalHistory" class="history muted" style="margin-top:10px">Brak zapisanych sygnałów. Odśwież analizę, aby rozpocząć zbieranie danych.</div>
+</div>
+<div class="panel">
+ <h2>BACKTEST · WYNIKI SYGNAŁÓW</h2>
+ <div class="muted">Wyniki kroczące liczone od wdrożenia tej wersji aplikacji, na podstawie późniejszej zmiany ceny.</div>
+ <div class="controls" style="margin:12px 0">
+  <label for="testExpiry" class="muted" style="align-self:center">Wygaśnięcie:</label>
+  <select id="testExpiry"><option value="1">1 minuta</option><option value="2">2 minuty</option><option value="5">5 minut</option></select>
+  <button id="runBacktest" class="primary" type="button">Pokaż wyniki</button>
+ </div>
+ <div class="metrics">
+  <div class="metric"><span>Rozliczone sygnały</span><strong id="btSettled">0</strong></div>
+  <div class="metric"><span>Wygrane / przegrane</span><strong id="btWL">0 / 0</strong></div>
+  <div class="metric"><span>Skuteczność</span><strong id="btRate">—</strong></div>
+ </div>
+ <p id="btNote" class="muted">Brak wystarczających danych. Najpierw aplikacja musi zebrać i rozliczyć sygnały.</p>
+</div>
+<p class="note">Wyniki historyczne tego modułu nie są pełnym backtestem na archiwalnych świecach. Są testem kroczącym od wdrożenia. Wynik ceny nie uwzględnia opóźnień, spreadu ani warunków wypłaty brokera. Ocena jakości nie jest prawdopodobieństwem wygranej.</p>
+<p class="note">DEMO: analiza ma charakter edukacyjny. Sygnały CALL/PUT nie gwarantują wyniku i nie otwierają transakcji. Nie jest to połączenie z Pocket Option ani rekomendacja inwestycyjna.</p>
 <p class="note">DEMO: analiza ma charakter edukacyjny. Sygnały CALL/PUT nie gwarantują wyniku i nie otwierają transakcji. Nie jest to połączenie z Pocket Option ani rekomendacja inwestycyjna.</p>
 </main>
 <script>
@@ -371,14 +393,18 @@ function makeChart(id){
 }
 async function refreshSignalHistory(){
  try{
-  const rows=await fetch('/api/signal-history?limit=20').then(r=>r.json());
+  const response=await fetch('/api/signal-history?limit=20');
+  if(!response.ok) throw new Error('Błąd pobierania historii');
+  const rows=await response.json();
   setText('signalHistory',rows.length?rows.map(x=>new Date(x.candle_time*1000).toLocaleString('pl-PL')+' | '+x.direction+' | jakość '+x.score+'/100 | 1m: '+(x.outcome_1m||'oczekuje')+' | 2m: '+(x.outcome_2m||'oczekuje')+' | 5m: '+(x.outcome_5m||'oczekuje')).join('\n'):'Brak zapisanych sygnałów. Zostaw aplikację uruchomioną, aby zaczęła zbierać dane.');
  }catch(e){setText('signalHistory','Nie udało się pobrać historii sygnałów.');}
 }
 async function showBacktest(){
  try{
   const expiry=document.getElementById('testExpiry').value;
-  const d=await fetch('/api/backtest?expiry='+expiry).then(r=>r.json());
+  const response=await fetch('/api/backtest?expiry='+expiry);
+  if(!response.ok) throw new Error('Błąd pobierania backtestu');
+  const d=await response.json();
   setText('btSettled',d.settled+' (oczekuje: '+d.pending+')');
   setText('btWL',d.wins+' / '+d.losses);
   setText('btRate',d.win_rate==null?'—':d.win_rate+'%');
@@ -423,7 +449,8 @@ async function loadSignal(){
    macdSignalLine.setData(d.macd_signal_series.filter(x=>x.value!==null));
    priceChart.timeScale().fitContent();rsiChart.timeScale().fitContent();macdChart.timeScale().fitContent();
   }
-  setText('lastUpdate','Ostatnia aktualizacja: '+new Date().toLocaleTimeString('pl-PL')+' · '+currentInterval);\n   refreshSignalHistory();showBacktest();
+  setText('lastUpdate','Ostatnia aktualizacja: '+new Date().toLocaleTimeString('pl-PL')+' · '+currentInterval);
+  refreshSignalHistory();showBacktest();
  }catch(e){setText('lastUpdate','Błąd: '+e.message);document.getElementById('signal').textContent='BRAK DANYCH';}
 }
 async function refreshStats(){
@@ -436,7 +463,8 @@ async function refreshStats(){
 document.querySelectorAll('.interval').forEach(b=>b.addEventListener('click',()=>{
  document.querySelectorAll('.interval').forEach(x=>x.classList.remove('active'));b.classList.add('active');currentInterval=b.dataset.interval;loadSignal();
 }));
-document.getElementById('refresh').addEventListener('click',loadSignal);\ndocument.getElementById('runBacktest').addEventListener('click',showBacktest);
+document.getElementById('refresh').addEventListener('click',loadSignal);
+document.getElementById('runBacktest').addEventListener('click',showBacktest);
 document.getElementById('tradeForm').addEventListener('submit',async e=>{
  e.preventDefault();
  const data={asset:document.getElementById('asset').value,direction:document.getElementById('direction').value,stake:Number(document.getElementById('stake').value),result:document.getElementById('result').value};
