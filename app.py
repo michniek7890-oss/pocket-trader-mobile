@@ -193,3 +193,105 @@ def get_stats():
         "losses": row[2] or 0,
         "profit": row[3]
     }
+
+
+# --- ANALIZA FOREX: TWELVE DATA (TRYB DEMO) ---
+import os
+import json
+import urllib.parse
+import urllib.request
+import urllib.error
+
+
+def calculate_ema(values, period):
+    if len(values) < period:
+        return None
+    multiplier = 2 / (period + 1)
+    ema = sum(values[:period]) / period
+    for value in values[period:]:
+        ema = (value * multiplier) + (ema * (1 - multiplier))
+    return ema
+
+
+def calculate_rsi(values, period=14):
+    if len(values) <= period:
+        return None
+    changes = [values[i] - values[i - 1] for i in range(1, len(values))]
+    recent = changes[-period:]
+    gains = [x for x in recent if x > 0]
+    losses = [-x for x in recent if x < 0]
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss == 0:
+        return 100.0
+    return 100 - (100 / (1 + avg_gain / avg_loss))
+
+
+@app.get("/api/forex/signal")
+def forex_signal():
+    api_key = os.getenv("TWELVE_DATA_API_KEY")
+    if not api_key:
+        return {"error": "Brak klucza API w ustawieniach Render."}
+
+    params = urllib.parse.urlencode({
+        "symbol": "EUR/USD",
+        "interval": "1min",
+        "outputsize": "100",
+        "apikey": api_key
+    })
+    url = "https://api.twelvedata.com/time_series?" + params
+
+    try:
+        request = urllib.request.Request(
+            url, headers={"User-Agent": "PocketTraderDemo/1.0"}
+        )
+        with urllib.request.urlopen(request, timeout=15) as response:
+            data = json.loads(response.read().decode("utf-8"))
+
+        if "values" not in data:
+            return {"error": "Dostawca danych nie zwrócił notowań. Sprawdź limit API i ustawienia klucza."}
+
+        candles = list(reversed(data["values"]))
+        closes = [float(candle["close"]) for candle in candles]
+
+        if len(closes) < 35:
+            return {"error": "Za mało danych do obliczenia wskaźników."}
+
+        ema9 = calculate_ema(closes, 9)
+        ema21 = calculate_ema(closes, 21)
+        rsi = calculate_rsi(closes, 14)
+
+        macd_values = []
+        for i in range(26, len(closes) + 1):
+            subset = closes[:i]
+            macd_values.append(
+                calculate_ema(subset, 12) - calculate_ema(subset, 26)
+            )
+
+        macd = macd_values[-1]
+        macd_signal = calculate_ema(macd_values, 9)
+
+        signal = "NO SIGNAL"
+        if ema9 > ema21 and 50 < rsi < 70 and macd > macd_signal:
+            signal = "CALL"
+        elif ema9 < ema21 and 30 < rsi < 50 and macd < macd_signal:
+            signal = "PUT"
+
+        return {
+            "mode": "DEMO",
+            "symbol": "EUR/USD",
+            "interval": "1min",
+            "price": round(closes[-1], 5),
+            "ema9": round(ema9, 5),
+            "ema21": round(ema21, 5),
+            "rsi14": round(rsi, 2),
+            "macd": round(macd, 6),
+            "macd_signal": round(macd_signal, 6),
+            "signal": signal,
+            "note": "Sygnał testowy, nie gwarantuje zysku. Nie otwiera transakcji."
+        }
+
+    except urllib.error.URLError:
+        return {"error": "Nie udało się połączyć z dostawcą danych."}
+    except Exception:
+        return {"error": "Wystąpił błąd analizy danych. Spróbuj ponownie."}
