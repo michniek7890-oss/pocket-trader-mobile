@@ -13,6 +13,24 @@ import urllib.parse
 import urllib.request
 import urllib.error
 
+INSTRUMENTS = [
+ {"symbol":"EUR/USD","name":"Euro / dolar","category":"Forex"}, {"symbol":"GBP/USD","name":"Funt / dolar","category":"Forex"},
+ {"symbol":"USD/JPY","name":"Dolar / jen","category":"Forex"}, {"symbol":"AUD/USD","name":"Dolar australijski / dolar","category":"Forex"},
+ {"symbol":"USD/CAD","name":"Dolar / dolar kanadyjski","category":"Forex"}, {"symbol":"USD/CHF","name":"Dolar / frank","category":"Forex"},
+ {"symbol":"NZD/USD","name":"Dolar nowozelandzki / dolar","category":"Forex"}, {"symbol":"EUR/JPY","name":"Euro / jen","category":"Forex"},
+ {"symbol":"EUR/GBP","name":"Euro / funt","category":"Forex"}, {"symbol":"XAU/USD","name":"Złoto / dolar","category":"Surowce"},
+ {"symbol":"XAG/USD","name":"Srebro / dolar","category":"Surowce"}, {"symbol":"WTI","name":"Ropa WTI","category":"Surowce"},
+ {"symbol":"BRENT","name":"Ropa Brent","category":"Surowce"}, {"symbol":"SPX","name":"S&P 500","category":"Indeksy"},
+ {"symbol":"NDX","name":"Nasdaq 100","category":"Indeksy"}, {"symbol":"DJI","name":"Dow Jones","category":"Indeksy"},
+ {"symbol":"DAX","name":"DAX 40","category":"Indeksy"}, {"symbol":"FTSE","name":"FTSE 100","category":"Indeksy"},
+ {"symbol":"AAPL","name":"Apple","category":"Akcje"}, {"symbol":"MSFT","name":"Microsoft","category":"Akcje"},
+ {"symbol":"NVDA","name":"NVIDIA","category":"Akcje"}, {"symbol":"TSLA","name":"Tesla","category":"Akcje"},
+ {"symbol":"AMZN","name":"Amazon","category":"Akcje"}, {"symbol":"GOOGL","name":"Alphabet","category":"Akcje"},
+ {"symbol":"BTC/USD","name":"Bitcoin / dolar","category":"Kryptowaluty"}, {"symbol":"ETH/USD","name":"Ethereum / dolar","category":"Kryptowaluty"},
+ {"symbol":"XRP/USD","name":"XRP / dolar","category":"Kryptowaluty"}, {"symbol":"SOL/USD","name":"Solana / dolar","category":"Kryptowaluty"}
+]
+INSTRUMENT_BY_SYMBOL = {x["symbol"]: x for x in INSTRUMENTS}
+
 app = FastAPI(title="Pocket Trader Mobile DEMO")
 DB = Path("trades.db")
 _DATA_CACHE = {}
@@ -35,7 +53,7 @@ def init_db():
         con.execute("""
             CREATE TABLE IF NOT EXISTS signal_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                candle_time INTEGER NOT NULL UNIQUE,
+                candle_time INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
                 asset TEXT NOT NULL,
                 direction TEXT NOT NULL,
@@ -47,6 +65,14 @@ def init_db():
                 outcome_5m TEXT
             )
         """)
+        con.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_signal_asset_candle ON signal_history(asset, candle_time)")
+        # Remove the legacy global unique constraint on candle_time so different symbols can share a timestamp.
+        schema = con.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='signal_history'").fetchone()
+        if schema and "candle_time INTEGER NOT NULL UNIQUE" in (schema[0] or ""):
+            con.execute("CREATE TABLE signal_history_new (id INTEGER PRIMARY KEY AUTOINCREMENT, candle_time INTEGER NOT NULL, created_at TEXT NOT NULL, asset TEXT NOT NULL, direction TEXT NOT NULL, score INTEGER NOT NULL, price REAL NOT NULL, reasons TEXT NOT NULL, outcome_1m TEXT, outcome_2m TEXT, outcome_5m TEXT, UNIQUE(asset,candle_time))")
+            con.execute("INSERT OR IGNORE INTO signal_history_new SELECT * FROM signal_history")
+            con.execute("DROP TABLE signal_history")
+            con.execute("ALTER TABLE signal_history_new RENAME TO signal_history")
 
 
 init_db()
@@ -185,14 +211,15 @@ def build_indicators(candles):
     }
 
 
-def fetch_candles(interval, api_key, outputsize=220):
+def fetch_candles(interval, api_key, symbol="EUR/USD", outputsize=220):
     now = time.time()
     with _CACHE_LOCK:
-        cached = _DATA_CACHE.get(interval)
+        cache_key = symbol + "|" + interval
+        cached = _DATA_CACHE.get(cache_key)
         if cached and now - cached["time"] < _CACHE_TTL:
             return cached["candles"]
     params = urllib.parse.urlencode({
-        "symbol": "EUR/USD", "interval": interval,
+        "symbol": symbol, "interval": interval,
         "outputsize": str(outputsize), "apikey": api_key
     })
     url = "https://api.twelvedata.com/time_series?" + params
@@ -214,7 +241,7 @@ def fetch_candles(interval, api_key, outputsize=220):
     if len(candles) < 205:
         raise ValueError(f"Za mało świec dla {interval}: potrzeba co najmniej 205, otrzymano {len(candles)}.")
     with _CACHE_LOCK:
-        _DATA_CACHE[interval] = {"time": now, "candles": candles}
+        _DATA_CACHE[cache_key] = {"time": now, "candles": candles}
     return candles
 
 
@@ -323,8 +350,18 @@ form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}form but
 </head>
 <body><main>
 <div class="top"><div><h1>POCKET TRADER</h1><div class="muted">Mobilny terminal analityczny</div></div><span class="pill">TRYB DEMO</span></div>
+<div class="panel" id="instrumentPanel"><h2>WYBÓR INSTRUMENTU</h2>
+ <div class="muted">Wybierz kategorię i symbol. Dostępność notowań sprawdzamy u dostawcy po wyborze.</div>
+ <div class="controls" id="categoryButtons" style="margin:10px 0">
+ <button class="category active" data-category="Forex">Forex</button><button class="category" data-category="Surowce">Surowce</button>
+ <button class="category" data-category="Indeksy">Indeksy</button><button class="category" data-category="Akcje">Akcje</button>
+ <button class="category" data-category="Kryptowaluty">Kryptowaluty</button></div>
+ <input id="instrumentSearch" placeholder="Szukaj symbolu lub nazwy" aria-label="Szukaj instrumentu" style="width:100%;margin-bottom:8px">
+ <select id="instrumentSelect" style="width:100%;margin-bottom:8px"></select>
+ <div class="muted" id="instrumentStatus">EUR/USD · dostępność notowań do sprawdzenia</div>
+ <p class="note">Symbole są kandydatami do sprawdzenia w Twelve Data; dostęp zależy od planu API i sesji. To nie jest pełna lista Pocket Option. OTC Pocket Option wymaga osobnego, zgodnego źródła notowań.</p></div>
 <div class="panel">
- <div class="top"><div><h2>EUR/USD</h2><div class="muted" id="lastUpdate">Oczekiwanie na dane…</div></div><div class="signal neutral" id="signal">ŁADOWANIE</div></div>
+ <div class="top"><div><h2 id="chartAssetTitle">EUR/USD</h2><div class="muted" id="lastUpdate">Oczekiwanie na dane…</div></div><div class="signal neutral" id="signal">ŁADOWANIE</div></div>
  <div class="controls" style="margin:12px 0">
   <button class="interval active" data-interval="1min">M1</button><button class="interval" data-interval="5min">M5</button>
   <button class="interval" data-interval="15min">M15</button><button class="interval" data-interval="1h">H1</button>
@@ -353,11 +390,14 @@ form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}form but
  <h2 style="margin-top:15px">Uzasadnienie decyzji</h2>
  <ul class="reason-list" id="signalReasons"><li>Oczekiwanie na analizę…</li></ul>
 </div>
+<div class="panel"><h2>HISTORIA SYGNAŁÓW · wybrany instrument</h2><div id="signalHistory" class="history muted">Brak zapisanych sygnałów.</div></div>
+<div class="panel"><h2>BACKTEST · WYNIKI SYGNAŁÓW</h2><div class="controls" style="margin-bottom:8px"><select id="testExpiry"><option value="1">1 minuta</option><option value="2">2 minuty</option><option value="5">5 minut</option></select><button id="runBacktest" class="primary">Przelicz</button></div>
+<div class="metrics"><div class="metric"><span>Rozliczone sygnały</span><strong id="btSettled">0</strong></div><div class="metric"><span>Wygrane / przegrane</span><strong id="btWL">0 / 0</strong></div><div class="metric"><span>Skuteczność</span><strong id="btRate">—</strong></div></div><p id="btNote" class="muted">Test kroczący; pominięte sygnały nie są wygranymi ani stratami.</p></div>
 <div class="panel"><h2>Dodaj transakcję testową</h2>
 <form id="tradeForm"><input id="asset" value="EUR/USD" aria-label="Instrument"><select id="direction"><option value="CALL">CALL</option><option value="PUT">PUT</option></select><input id="stake" type="number" min="0.01" step="0.01" value="10" aria-label="Kwota DEMO"><select id="result"><option value="win">Wygrana testowa</option><option value="loss">Przegrana testowa</option></select><button class="primary" type="submit">Zapisz symulację</button></form></div>
 <div class="panel"><h2>Statystyki DEMO</h2><div class="metrics"><div class="metric"><span>Transakcje</span><strong id="count">0</strong></div><div class="metric"><span>Wygrane / przegrane</span><strong id="wl">0 / 0</strong></div><div class="metric"><span>Wynik DEMO</span><strong id="profit">0.00</strong></div></div></div>
 <div class="panel"><h2>Historia</h2><div id="history" class="history muted">Brak transakcji</div></div>
-<p class="note">DEMO: analiza ma charakter edukacyjny. Sygnały CALL/PUT nie gwarantują wyniku i nie otwierają transakcji. Nie jest to połączenie z Pocket Option ani rekomendacja inwestycyjna.</p>
+<p class="note">DEMO: analiza ma charakter edukacyjny. Sygnały CALL/PUT nie gwarantują wyniku i nie otwierają transakcji. Nie jest to połączenie z Pocket Option ani rekomendacja inwestycyjna. Lista symboli jest katalogiem do sprawdzenia w Twelve Data; OTC nie jest obsługiwane tym źródłem.</p>
 </main>
 <script>
 let currentInterval='1min', priceChart, rsiChart, macdChart, candleSeries, ema9Series, ema21Series, ema50Series, ema200Series, rsiSeries, macdLine, macdSignalLine;
@@ -369,16 +409,29 @@ function makeChart(id){
   rightPriceScale:{borderColor:'#40536b'},timeScale:{borderColor:'#40536b',timeVisible:true,secondsVisible:false},
   crosshair:{mode:0}});
 }
+let currentCategory='Forex', currentSymbol='EUR/USD', instrumentCatalog=[];
+function renderInstrumentOptions(){
+ const q=(document.getElementById('instrumentSearch').value||'').toLowerCase().trim();
+ const sel=document.getElementById('instrumentSelect');
+ const list=instrumentCatalog.filter(x=>x.category===currentCategory && (!q||(x.symbol+' '+x.name).toLowerCase().includes(q)));
+ sel.innerHTML=''; list.forEach(x=>{const o=document.createElement('option');o.value=x.symbol;o.textContent=x.symbol+' — '+x.name;sel.appendChild(o);});
+ if(list.some(x=>x.symbol===currentSymbol))sel.value=currentSymbol; else if(list.length){currentSymbol=list[0].symbol;sel.value=currentSymbol;}
+ setText('instrumentStatus',(sel.value||'Brak instrumentu')+' · dostępność sprawdzana przy pobieraniu danych');setText('chartAssetTitle',currentSymbol);
+}
+async function initInstrumentSelector(){try{instrumentCatalog=await fetch('/api/instruments').then(r=>r.json());renderInstrumentOptions();}catch(e){setText('instrumentStatus','Nie udało się pobrać listy instrumentów.');}}
+document.querySelectorAll('.category').forEach(b=>b.addEventListener('click',()=>{document.querySelectorAll('.category').forEach(x=>x.classList.remove('active'));b.classList.add('active');currentCategory=b.dataset.category;renderInstrumentOptions();loadSignal();}));
+document.getElementById('instrumentSearch').addEventListener('input',renderInstrumentOptions);
+document.getElementById('instrumentSelect').addEventListener('change',e=>{currentSymbol=e.target.value;setText('chartAssetTitle',currentSymbol);loadSignal();});
 async function refreshSignalHistory(){
  try{
-  const rows=await fetch('/api/signal-history?limit=20').then(r=>r.json());
-  setText('signalHistory',rows.length?rows.map(x=>new Date(x.candle_time*1000).toLocaleString('pl-PL')+' | '+x.direction+' | jakość '+x.score+'/100 | 1m: '+(x.outcome_1m||'oczekuje')+' | 2m: '+(x.outcome_2m||'oczekuje')+' | 5m: '+(x.outcome_5m||'oczekuje')).join('\n'):'Brak zapisanych sygnałów. Zostaw aplikację uruchomioną, aby zaczęła zbierać dane.');
+  const rows=await fetch('/api/signal-history?limit=20&asset='+encodeURIComponent(currentSymbol)).then(r=>r.json());
+  setText('signalHistory',rows.length?rows.map(x=>new Date(x.candle_time*1000).toLocaleString('pl-PL')+' | '+(x.direction==='NO SIGNAL'?'POMINIĘTO':x.direction)+' | jakość '+x.score+'/100 | 1m: '+(x.outcome_1m||'oczekuje')+' | 2m: '+(x.outcome_2m||'oczekuje')+' | 5m: '+(x.outcome_5m||'oczekuje')).join('\n'):'Brak zapisanych sygnałów. Zostaw aplikację uruchomioną, aby zaczęła zbierać dane.');
  }catch(e){setText('signalHistory','Nie udało się pobrać historii sygnałów.');}
 }
 async function showBacktest(){
  try{
   const expiry=document.getElementById('testExpiry').value;
-  const d=await fetch('/api/backtest?expiry='+expiry).then(r=>r.json());
+  const d=await fetch('/api/backtest?expiry='+expiry+'&asset='+encodeURIComponent(currentSymbol)).then(r=>r.json());
   setText('btSettled',d.settled+' (oczekuje: '+d.pending+')');
   setText('btWL',d.wins+' / '+d.losses);
   setText('btRate',d.win_rate==null?'—':d.win_rate+'%');
@@ -402,7 +455,7 @@ function setText(id,value){document.getElementById(id).textContent=value}
 async function loadSignal(){
  setText('lastUpdate','Pobieranie danych…');
  try{
-  const response=await fetch('/api/forex/signal?interval='+encodeURIComponent(currentInterval));
+  const response=await fetch('/api/forex/signal?interval='+encodeURIComponent(currentInterval)+'&symbol='+encodeURIComponent(currentSymbol));
   const d=await response.json();if(!response.ok||d.error)throw new Error(d.error||'Błąd pobierania danych');
   setText('price',Number(d.price).toFixed(5));setText('ema9',Number(d.ema9).toFixed(5));setText('ema21',Number(d.ema21).toFixed(5));
   setText('rsi',Number(d.rsi14).toFixed(2));setText('rsiText',d.rsi14>=70?'Wykupienie':d.rsi14<=30?'Wyprzedanie':'Strefa neutralna');
@@ -423,7 +476,8 @@ async function loadSignal(){
    macdSignalLine.setData(d.macd_signal_series.filter(x=>x.value!==null));
    priceChart.timeScale().fitContent();rsiChart.timeScale().fitContent();macdChart.timeScale().fitContent();
   }
-  setText('lastUpdate','Ostatnia aktualizacja: '+new Date().toLocaleTimeString('pl-PL')+' · '+currentInterval);\n   refreshSignalHistory();showBacktest();
+  setText('lastUpdate','Ostatnia aktualizacja: '+new Date().toLocaleTimeString('pl-PL')+' · '+currentInterval+' · '+currentSymbol);
+   setText('instrumentStatus',currentSymbol+' · dane dostawcy dostępne');\n   refreshSignalHistory();showBacktest();
  }catch(e){setText('lastUpdate','Błąd: '+e.message);document.getElementById('signal').textContent='BRAK DANYCH';}
 }
 async function refreshStats(){
@@ -442,8 +496,13 @@ document.getElementById('tradeForm').addEventListener('submit',async e=>{
  const data={asset:document.getElementById('asset').value,direction:document.getElementById('direction').value,stake:Number(document.getElementById('stake').value),result:document.getElementById('result').value};
  try{const r=await fetch('/api/trades',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const d=await r.json();if(!r.ok||d.error)throw new Error(d.error||'Nie udało się zapisać');await refreshStats();}catch(err){alert(err.message);}
 });
-initCharts();loadSignal();refreshStats();setInterval(loadSignal,60000);
+initCharts();initInstrumentSelector();loadSignal();refreshStats();setInterval(loadSignal,60000);
 </script></body></html>"""
+
+
+@app.get("/api/instruments")
+def get_instruments():
+    return INSTRUMENTS
 
 
 @app.post("/api/trades")
@@ -484,7 +543,7 @@ def get_stats():
     return {"count": row[0], "wins": row[1] or 0, "losses": row[2] or 0, "profit": row[3]}
 
 
-def save_signal_and_update_results(candles, ai):
+def save_signal_and_update_results(candles, ai, asset="EUR/USD"):
     """Zapisuje jeden sygnał na zamkniętą świecę M1 i uzupełnia wyniki po czasie."""
     if len(candles) < 2:
         return
@@ -497,12 +556,12 @@ def save_signal_and_update_results(candles, ai):
         con.execute("""
             INSERT OR IGNORE INTO signal_history
             (candle_time, created_at, asset, direction, score, price, reasons)
-            VALUES (?, ?, 'EUR/USD', ?, ?, ?, ?)
-        """, (signal_time, datetime.now(timezone.utc).isoformat(), direction,
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (signal_time, datetime.now(timezone.utc).isoformat(), asset, direction,
               int(ai["score"]), float(signal_candle["close"]),
               json.dumps(ai["reasons"], ensure_ascii=False)))
         # Wynik porównujemy z ceną zamknięcia świecy po upływie danego czasu.
-        for row in con.execute("SELECT id, candle_time, direction, price FROM signal_history WHERE direction IN ('CALL','PUT') AND (outcome_1m IS NULL OR outcome_2m IS NULL OR outcome_5m IS NULL)").fetchall():
+        for row in con.execute("SELECT id, candle_time, direction, price FROM signal_history WHERE asset=? AND direction IN ('CALL','PUT') AND (outcome_1m IS NULL OR outcome_2m IS NULL OR outcome_5m IS NULL)" , (asset,)).fetchall():
             rid, start, side, entry = row
             updates = {}
             for minutes, column in ((1, "outcome_1m"), (2, "outcome_2m"), (5, "outcome_5m")):
@@ -517,10 +576,10 @@ def save_signal_and_update_results(candles, ai):
 
 
 @app.get("/api/signal-history")
-def get_signal_history(limit: int = Query(30, ge=1, le=200)):
+def get_signal_history(limit: int = Query(30, ge=1, le=200), asset: str = Query("EUR/USD", min_length=1, max_length=30)):
     with sqlite3.connect(DB) as con:
         con.row_factory = sqlite3.Row
-        rows = con.execute("SELECT * FROM signal_history ORDER BY candle_time DESC LIMIT ?", (limit,)).fetchall()
+        rows = con.execute("SELECT * FROM signal_history WHERE asset=? ORDER BY candle_time DESC LIMIT ?", (asset, limit)).fetchall()
     result = []
     for row in rows:
         item = dict(row)
@@ -530,13 +589,14 @@ def get_signal_history(limit: int = Query(30, ge=1, le=200)):
 
 
 @app.get("/api/backtest")
-def get_backtest(expiry: int = Query(1, ge=1, le=5)):
+def get_backtest(expiry: int = Query(1, ge=1, le=5), asset: str = Query("EUR/USD", min_length=1, max_length=30)):
     if expiry not in (1, 2, 5):
         raise HTTPException(status_code=400, detail="Dozwolone wygaśnięcia: 1, 2 lub 5 minut.")
     column = f"outcome_{expiry}m"
     with sqlite3.connect(DB) as con:
         total, wins, losses, ties, pending = con.execute(
-            f"SELECT COUNT(*), SUM({column}='win'), SUM({column}='loss'), SUM({column}='tie'), SUM({column} IS NULL) FROM signal_history WHERE direction IN ('CALL','PUT')"
+            f"SELECT COUNT(*), SUM({column}='win'), SUM({column}='loss'), SUM({column}='tie'), SUM({column} IS NULL) FROM signal_history WHERE direction IN ('CALL','PUT') AND asset=?",
+            (asset,)
         ).fetchone()
     wins, losses, ties, pending = wins or 0, losses or 0, ties or 0, pending or 0
     settled = wins + losses + ties
@@ -547,16 +607,18 @@ def get_backtest(expiry: int = Query(1, ge=1, le=5)):
 
 
 @app.get("/api/forex/signal")
-def forex_signal(interval: str = Query("1min", pattern="^(1min|5min|15min|1h)$")):
+def forex_signal(interval: str = Query("1min", pattern="^(1min|5min|15min|1h)$"), symbol: str = Query("EUR/USD", min_length=1, max_length=30)):
     api_key = os.getenv("TWELVE_DATA_API_KEY")
     if not api_key:
         return {"error": "Brak klucza API w ustawieniach Render."}
+    if symbol not in INSTRUMENT_BY_SYMBOL:
+        raise HTTPException(status_code=400, detail="Instrument nie znajduje się na liście wyboru.")
     intervals = ["1min", "5min", "15min", "1h"]
     try:
-        candles_by_interval = {tf: fetch_candles(tf, api_key) for tf in intervals}
+        candles_by_interval = {tf: fetch_candles(tf, api_key, symbol=symbol) for tf in intervals}
         snapshots = {tf: latest_snapshot(candles_by_interval[tf]) for tf in intervals}
         ai = evaluate_ai_signal(candles_by_interval, snapshots)
-        save_signal_and_update_results(candles_by_interval["1min"], ai)
+        save_signal_and_update_results(candles_by_interval["1min"], ai, asset=symbol)
 
         chart_candles = candles_by_interval[interval]
         chart_ind = snapshots[interval]["indicators"]
@@ -570,7 +632,7 @@ def forex_signal(interval: str = Query("1min", pattern="^(1min|5min|15min|1h)$")
             return chart_ind[key][chart_last]
 
         return {
-            "mode": "DEMO", "symbol": "EUR/USD", "interval": interval,
+            "mode": "DEMO", "symbol": symbol, "interval": interval,
             "price": round(chart_candles[-1]["close"], 5),
             "ema9": round(last_value("ema9"), 5),
             "ema21": round(last_value("ema21"), 5),
@@ -587,7 +649,7 @@ def forex_signal(interval: str = Query("1min", pattern="^(1min|5min|15min|1h)$")
             "rsi_series": points(chart_ind["rsi"], chart_candles),
             "macd_series": points(chart_ind["macd"], chart_candles),
             "macd_signal_series": points(chart_ind["macd_signal"], chart_candles),
-            "note": "Analiza edukacyjna DEMO. Ocena jakości nie jest prawdopodobieństwem wygranej. Sygnały nie otwierają transakcji."
+            "note": "Analiza edukacyjna DEMO. Ocena jakości nie jest prawdopodobieństwem wygranej. Sygnały nie otwierają transakcji. Notowania Twelve Data mogą różnić się od OTC Pocket Option."
         }
     except urllib.error.URLError:
         return {"error": "Nie udało się połączyć z dostawcą danych."}
